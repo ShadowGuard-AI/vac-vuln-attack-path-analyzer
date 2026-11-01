@@ -1,6 +1,8 @@
 import argparse
 import logging
 import json
+import sys
+from pathlib import Path
 import networkx as nx
 import pandas as pd
 import requests
@@ -99,50 +101,36 @@ def load_network_topology(file_path):
 
 def aggregate_vulnerability_data(cve_id):
     """
-    Aggregates vulnerability data from multiple sources (NVD, ExploitDB) based on CVE ID.
-    Args:
-        cve_id (str): The CVE ID to search for.
-    Returns:
-        dict: A dictionary containing aggregated vulnerability information.
+    Aggregates vulnerability data from NVD (API v2) and ExploitDB for a CVE ID.
+    Parse failures for one source are contained and logged; they do not
+    abort the run.
     """
-    aggregated_data = {}
+    aggregated_data = {'nvd': None, 'exploitdb': []}
     try:
-        # NVD Data
-        nvd_url = f"{NVD_API_BASE_URL}?cveId={cve_id}"
-        response = requests.get(nvd_url)
-        response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+        response = requests.get(NVD_API_BASE_URL, params={"cveId": cve_id}, timeout=10)
+        response.raise_for_status()
         nvd_data = response.json()
-        if nvd_data and nvd_data['totalResults'] > 0:  # Check if results are present
-            # This reads the version 1 response shape from a version 2 endpoint.
-            # A successful v2 answer has neither result nor CVE_Items, so the
-            # KeyError lands outside the RequestException handler and the whole
-            # aggregation for that CVE is lost, not just the NVD half.
-            aggregated_data['nvd'] = nvd_data['result']['CVE_Items'][0]  # Access the actual result
+        vulns = nvd_data.get('vulnerabilities') or []
+        if vulns:
+            aggregated_data['nvd'] = vulns[0].get('cve')
         else:
             logging.warning(f"No data found in NVD for CVE: {cve_id}")
-            aggregated_data['nvd'] = None  # Ensure the field is present even if empty
-
-
-        # ExploitDB Data (Scraping) - Limited and subject to change
-        exploitdb_url = f"{EXPLOITDB_BASE_URL}?ghdb=&desc={cve_id}&author=&platform=0&port=&type=0&osvdb=&cve="  # Updated URL
-        try:
-            response = requests.get(exploitdb_url)
-            response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
-            soup = BeautifulSoup(response.content, 'html.parser')
-            #Example of scraping: You might need to refine this based on ExploitDB's HTML structure
-            #exploit_links = [a['href'] for a in soup.find_all('a', href=True) if 'exploit-db' in a['href']]
-            #aggregated_data['exploitdb'] = exploit_links
-            aggregated_data['exploitdb'] =  "ExploitDB scraping logic needs to be implemented, scraping is not guaranteed" # Placeholder
-
-        except requests.exceptions.RequestException as e:
-                logging.error(f"Error fetching from ExploitDB: {e}")
-                aggregated_data['exploitdb'] = None
-
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Error fetching data for CVE {cve_id}: {e}")
-        return None  # Return None if there's an error getting the data
-
-
+    except Exception as e:
+        logging.error(f"Error fetching NVD data for CVE {cve_id}: {e}")
+        aggregated_data['nvd'] = None
+    try:
+        response = requests.get(f"{EXPLOITDB_BASE_URL}search", params={"cve": cve_id}, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, 'html.parser')
+        links = []
+        for a in soup.find_all('a', href=True):
+            href = a['href']
+            if '/exploits/' in href and href not in links:
+                links.append(href)
+        aggregated_data['exploitdb'] = links
+    except Exception as e:
+        logging.error(f"Error fetching ExploitDB data for CVE {cve_id}: {e}")
+        aggregated_data['exploitdb'] = []
     return aggregated_data
 
 def analyze_attack_paths(vulnerability_data, topology, severity_threshold):
@@ -193,38 +181,68 @@ def save_attack_paths(attack_paths, output_file):
         with open(output_file, 'w') as f:
             json.dump(attack_paths, f, indent=4)
         logging.info(f"Attack paths saved to: {output_file}")
+        return True
     except Exception as e:
         logging.error(f"Error saving attack paths to {output_file}: {e}")
+        return False
 
 def main():
-    """
-    Main function to execute the vulnerability attack path analysis.
-    """
     parser = setup_argparse()
     args = parser.parse_args()
+
+    if args.output_file:
+        out_resolved = Path(args.output_file).resolve()
+        for input_path in (args.vulnerability_report, args.topology_file):
+            if out_resolved == Path(input_path).resolve():
+                logging.error(f"Output file {args.output_file} resolves to an input file ({input_path}); refusing to overwrite it.")
+                sys.exit(1)
 
     try:
         vulnerability_data = load_vulnerability_report(args.vulnerability_report)
         network_topology = load_network_topology(args.topology_file)
-
-        # Data aggregation (optional)
-        if args.aggregate_data:
-            # Assuming vulnerability_data has a 'cve' column
-            if 'cve' not in vulnerability_data.columns:
-                logging.error("CVE column missing in vulnerability report. Cannot perform data aggregation.")
-            else:
-                vulnerability_data['aggregated_data'] = vulnerability_data['cve'].apply(aggregate_vulnerability_data)
-
-
-        attack_paths = analyze_attack_paths(vulnerability_data, network_topology, args.severity_threshold)
-
-        if args.output_file:
-            save_attack_paths(attack_paths, args.output_file)
-        else:
-            print(json.dumps(attack_paths, indent=4))  # Print to console if no output file specified
-
     except Exception as e:
         logging.error(f"An error occurred: {e}")
+        sys.exit(1)
+
+    missing = [c for c in ('severity', 'node') if c not in vulnerability_data.columns]
+    if missing:
+        logging.error(f"Vulnerability report is missing required column(s): {', '.join(missing)}. No analysis was performed.")
+        sys.exit(1)
+    if vulnerability_data.empty:
+        logging.error("Vulnerability report is empty. No analysis was performed.")
+        sys.exit(1)
+
+    aggregated_by_cve = {}
+    if args.aggregate_data:
+        if 'cve' not in vulnerability_data.columns:
+            logging.error("CVE column missing in vulnerability report. Cannot perform data aggregation.")
+            sys.exit(1)
+        for cve_id in vulnerability_data['cve'].dropna().unique():
+            try:
+                aggregated_by_cve[str(cve_id)] = aggregate_vulnerability_data(str(cve_id))
+            except Exception as e:
+                logging.error(f"Aggregation failed for CVE {cve_id}: {e}")
+                aggregated_by_cve[str(cve_id)] = {'nvd': None, 'exploitdb': []}
+
+    try:
+        attack_paths = analyze_attack_paths(vulnerability_data, network_topology, args.severity_threshold)
+    except Exception as e:
+        logging.error(f"An error occurred: {e}")
+        sys.exit(1)
+
+    if not attack_paths:
+        print(f"No vulnerabilities qualified at or above the severity threshold {args.severity_threshold}; no attack paths were produced.")
+        sys.exit(1)
+
+    result = attack_paths
+    if args.aggregate_data:
+        result = {"attack_paths": attack_paths, "aggregated_data": aggregated_by_cve}
+
+    if args.output_file:
+        if not save_attack_paths(result, args.output_file):
+            sys.exit(1)
+    else:
+        print(json.dumps(result, indent=4, default=str))
 
 if __name__ == "__main__":
     main()
