@@ -80,6 +80,9 @@ def load_network_topology(file_path):
         nodes = topology_data.get('nodes', [])
         edges = topology_data.get('edges', [])
 
+        # The topology is undirected, so every path I report can be walked in
+        # both directions. A one way segment in the real network, a firewall
+        # rule or a unidirectional route, has no way to be expressed here.
         graph = nx.Graph()
         graph.add_nodes_from(nodes)
         graph.add_edges_from(edges)
@@ -110,6 +113,10 @@ def aggregate_vulnerability_data(cve_id):
         response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
         nvd_data = response.json()
         if nvd_data and nvd_data['totalResults'] > 0:  # Check if results are present
+            # This reads the version 1 response shape from a version 2 endpoint.
+            # A successful v2 answer has neither result nor CVE_Items, so the
+            # KeyError lands outside the RequestException handler and the whole
+            # aggregation for that CVE is lost, not just the NVD half.
             aggregated_data['nvd'] = nvd_data['result']['CVE_Items'][0]  # Access the actual result
         else:
             logging.warning(f"No data found in NVD for CVE: {cve_id}")
@@ -149,6 +156,11 @@ def analyze_attack_paths(vulnerability_data, topology, severity_threshold):
         dict: A dictionary containing the identified attack paths.
     """
     attack_paths = {}
+    # Missing severity or node columns raise here, before any per path
+    # handling exists, and main logs the error and still exits 0. The
+    # threshold is the only use severity gets: path ranking below is
+    # plain hop count, so a one hop path over a 7.0 node and a one hop
+    # path over a 10.0 node are presented as equals.
     vulnerable_nodes = vulnerability_data[vulnerability_data['severity'] >= severity_threshold]['node'].unique()
 
     for start_node in vulnerable_nodes:
@@ -160,6 +172,10 @@ def analyze_attack_paths(vulnerability_data, topology, severity_threshold):
                     path = nx.shortest_path(topology, source=start_node, target=target_node)
                     attack_paths[start_node][target_node] = path
                 except nx.NetworkXNoPath:
+                    # None covers three different stories: no route exists, the start
+                    # node is absent from the topology graph, or the search raised
+                    # something else entirely and was logged a line above. The saved
+                    # JSON keeps no trace of which one happened.
                     attack_paths[start_node][target_node] = None # No path found
                 except Exception as e:
                     logging.error(f"Error finding path from {start_node} to {target_node}: {e}")
